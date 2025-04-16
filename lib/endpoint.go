@@ -16,6 +16,7 @@ func GetDataUrl(cctvId string) (string, error) {
 		Port:     dbConfig.Port,
 		UserName: dbConfig.User,
 		Password: dbConfig.Passwd,
+		Database: dbConfig.Database,
 		SslMode:  &sslMode,
 	})
 

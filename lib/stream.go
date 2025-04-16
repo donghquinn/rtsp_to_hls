@@ -9,7 +9,7 @@ import (
 	"org.donghyuns.com/rtsphls/configs"
 )
 
-// RTSPWorker RTSP 스트림 처리 워커
+// RTSPWorker handles RTSP stream processing
 type RTSPWorker struct {
 	manager       *StreamManager
 	streamID      string
@@ -20,7 +20,7 @@ type RTSPWorker struct {
 	reconnectTime time.Duration
 }
 
-// NewRTSPWorker 새 RTSP 워커 생성
+// NewRTSPWorker creates a new RTSP worker
 func NewRTSPWorker(manager *StreamManager, streamID, url string, onDemand bool) *RTSPWorker {
 	return &RTSPWorker{
 		manager:       manager,
@@ -33,7 +33,7 @@ func NewRTSPWorker(manager *StreamManager, streamID, url string, onDemand bool) 
 	}
 }
 
-// Start 워커 시작
+// Start begins the worker's processing loop
 func (w *RTSPWorker) Start() {
 	if w.isRunning {
 		return
@@ -43,7 +43,7 @@ func (w *RTSPWorker) Start() {
 	go w.loop()
 }
 
-// Stop 워커 정지
+// Stop signals the worker to stop
 func (w *RTSPWorker) Stop() {
 	if !w.isRunning {
 		return
@@ -53,47 +53,65 @@ func (w *RTSPWorker) Stop() {
 	close(w.stopChan)
 }
 
-// loop 메인 처리 루프
+// loop is the main processing loop
 func (w *RTSPWorker) loop() {
-	defer w.manager.SetRunLock(w.streamID, false)
+	defer func() {
+		w.manager.SetRunLock(w.streamID, false)
+		log.Printf("[%s] RTSP worker stopped", w.streamID)
+	}()
 
+	// Main worker loop
 	for w.isRunning {
-		log.Printf("[%s] Stream trying to connect", w.streamID)
+		log.Printf("[%s] Stream connecting to %s", w.streamID, w.url)
 
 		err := w.processStream()
 		if err != nil {
-			log.Printf("[%s] Stream error: %s", w.streamID, err)
+			log.Printf("[%s] Stream error: %v", w.streamID, err)
 		}
 
+		// Check if we should continue or exit (for on-demand streams)
 		if w.onDemand && !w.manager.HasViewer(w.streamID) {
-			log.Printf("[%s] Stream stopped: no viewers", w.streamID)
+			log.Printf("[%s] On-demand stream stopping: no viewers", w.streamID)
 			break
 		}
 
-		// 재연결 전 대기
+		// Wait before reconnecting
 		select {
 		case <-w.stopChan:
 			return
 		case <-time.After(w.reconnectTime):
-			// 재연결 시도
+			// Continue to reconnect
 		}
 	}
 }
 
-// processStream RTSP 스트림 처리
+// processStream handles the RTSP connection and stream processing
 func (w *RTSPWorker) processStream() error {
-	keyFrameTimeout := time.NewTimer(20 * time.Second)
-	clientCheckTimeout := time.NewTimer(20 * time.Second)
+	// Timeouts for various conditions
+	const (
+		keyFrameTimeout    = 20 * time.Second
+		clientCheckTimeout = 20 * time.Second
+		dialTimeout        = 5 * time.Second
+		readWriteTimeout   = 5 * time.Second
+	)
 
+	keyFrameTimer := time.NewTimer(keyFrameTimeout)
+	clientCheckTimer := time.NewTimer(clientCheckTimeout)
+	defer func() {
+		keyFrameTimer.Stop()
+		clientCheckTimer.Stop()
+	}()
+
+	// Initialize segment processing variables
 	var prevKeyFrameTS time.Duration
 	var segmentBuffer []*av.Packet
 
-	// RTSP 클라이언트 연결
+	// Connect to RTSP source
 	client, err := rtspv2.Dial(rtspv2.RTSPClientOptions{
 		URL:              w.url,
 		DisableAudio:     false,
-		DialTimeout:      3 * time.Second,
-		ReadWriteTimeout: 3 * time.Second,
+		DialTimeout:      dialTimeout,
+		ReadWriteTimeout: readWriteTimeout,
 		Debug:            false,
 	})
 
@@ -102,62 +120,76 @@ func (w *RTSPWorker) processStream() error {
 	}
 	defer client.Close()
 
-	// 코덱 정보 업데이트
+	// Update codec information
 	if client.CodecData != nil {
 		w.manager.UpdateCodecs(w.streamID, client.CodecData)
 	}
 
-	// 오디오 전용 스트림인지 확인
+	// Determine if stream is audio-only
 	var isAudioOnly bool
 	if len(client.CodecData) == 1 && client.CodecData[0].Type().IsAudio() {
 		isAudioOnly = true
+		log.Printf("[%s] Detected audio-only stream", w.streamID)
 	}
 
-	// 메인 처리 루프
+	// Main packet processing loop
 	for {
 		select {
 		case <-w.stopChan:
+			log.Printf("[%s] Stop signal received", w.streamID)
 			return nil
 
-		case <-clientCheckTimeout.C:
+		case <-clientCheckTimer.C:
+			// For on-demand streams, check if we still have viewers
 			if w.onDemand && !w.manager.HasViewer(w.streamID) {
 				return configs.ErrStreamExitNoViewer
 			}
-			clientCheckTimeout.Reset(20 * time.Second)
+			clientCheckTimer.Reset(clientCheckTimeout)
 
-		case <-keyFrameTimeout.C:
+		case <-keyFrameTimer.C:
+			// If we haven't received a keyframe for too long, reconnect
 			return configs.ErrStreamExitNoVideoOnStream
 
 		case signal := <-client.Signals:
 			switch signal {
 			case rtspv2.SignalCodecUpdate:
+				log.Printf("[%s] Codec update received", w.streamID)
 				w.manager.UpdateCodecs(w.streamID, client.CodecData)
 			case rtspv2.SignalStreamRTPStop:
 				return configs.ErrStreamExitRtspDisconnect
 			}
 
-		case packet := <-client.OutgoingPacketQueue:
-			// 키프레임이거나 오디오 전용 스트림인 경우
-			if packet.IsKeyFrame || isAudioOnly {
-				keyFrameTimeout.Reset(20 * time.Second)
+		case packet, ok := <-client.OutgoingPacketQueue:
+			if !ok {
+				return configs.ErrStreamExitRtspDisconnect
+			}
 
-				// 이전 세그먼트가 있으면 HLS에 추가
-				if prevKeyFrameTS > 0 {
-					err := w.manager.AddHLSSegment(w.streamID, segmentBuffer, packet.Time-prevKeyFrameTS)
+			// Process packet for HLS segmentation and broadcast
+			if packet.IsKeyFrame || isAudioOnly {
+				// Reset keyframe timeout
+				keyFrameTimer.Reset(keyFrameTimeout)
+
+				// If we already have a segment, finalize it
+				if prevKeyFrameTS > 0 && len(segmentBuffer) > 0 {
+					segmentDuration := packet.Time - prevKeyFrameTS
+					err := w.manager.AddHLSSegment(w.streamID, segmentBuffer, segmentDuration)
 					if err != nil {
-						log.Printf("[%s] Error adding HLS segment: %s", w.streamID, err)
+						log.Printf("[%s] Error adding HLS segment: %v", w.streamID, err)
 					}
-					segmentBuffer = []*av.Packet{}
+					// Clear segment buffer for new segment
+					segmentBuffer = make([]*av.Packet, 0, len(segmentBuffer))
 				}
 
+				// Start new segment
 				prevKeyFrameTS = packet.Time
 			}
 
-			// 세그먼트 버퍼에 패킷 추가
-			segmentBuffer = append(segmentBuffer, packet)
+			// Add packet to current segment buffer
+			pktCopy := packet
+			segmentBuffer = append(segmentBuffer, pktCopy)
 
-			// 클라이언트에 패킷 브로드캐스트
-			w.manager.BroadcastPacket(w.streamID, packet)
+			// Broadcast packet to all connected clients
+			w.manager.BroadcastPacket(w.streamID, *packet)
 		}
 	}
 }

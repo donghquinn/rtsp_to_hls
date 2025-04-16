@@ -14,6 +14,7 @@ func Network() *gin.Engine {
 	allowedOrigins := strings.Split(allowedOriginsStr, ",")
 
 	router := gin.Default()
+
 	router.Use(cors.Default())
 	router.Use(cors.New(cors.Config{
 		AllowOrigins:     allowedOrigins,

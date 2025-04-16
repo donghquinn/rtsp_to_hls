@@ -12,16 +12,12 @@ import (
 	"org.donghyuns.com/rtsphls/configs"
 )
 
-const (
-	Success = "success"
-)
-
-// ServerConfig 서버 설정
+// ServerConfig represents server configuration
 type ServerConfig struct {
 	HTTPPort string `json:"http_port"`
 }
 
-// StreamConfig 스트림 설정
+// StreamConfig represents configuration for a single stream
 type StreamConfig struct {
 	URL              string            `json:"url"`
 	Status           bool              `json:"status"`
@@ -33,33 +29,36 @@ type StreamConfig struct {
 	Clients          map[string]Viewer `json:"-"`
 }
 
-// Segment HLS 세그먼트 캐시
+// Segment represents a cached HLS segment
 type Segment struct {
 	Duration time.Duration
 	Data     []*av.Packet
 }
 
-// Viewer 시청자 정보
+// Viewer represents a connected client
 type Viewer struct {
 	Channel chan av.Packet
 }
 
-// StreamManager 스트림 관리자
+// StreamManager manages multiple streams
 type StreamManager struct {
 	mutex   sync.RWMutex
 	Server  ServerConfig             `json:"server"`
 	Streams map[string]*StreamConfig `json:"streams"`
 }
 
-// NewStreamManager 새 스트림 관리자 생성
+// NewStreamManager creates a new stream manager instance
 func NewStreamManager() *StreamManager {
 	return &StreamManager{
-		Server:  ServerConfig{HTTPPort: "8083"},
+		Server: ServerConfig{
+			// Use configurable port or default
+			HTTPPort: configs.GlobalConfig.AppPort,
+		},
 		Streams: make(map[string]*StreamConfig),
 	}
 }
 
-// AddStream 스트림 추가
+// AddStream adds a new stream to the manager
 func (sm *StreamManager) AddStream(id string, url string, onDemand bool) {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
@@ -76,14 +75,35 @@ func (sm *StreamManager) AddStream(id string, url string, onDemand bool) {
 	}
 }
 
-// RemoveStream 스트림 제거
+// GetStream returns a stream by ID
+func (sm *StreamManager) GetStream(id string) (*StreamConfig, error) {
+	sm.mutex.RLock()
+	defer sm.mutex.RUnlock()
+
+	stream, exists := sm.Streams[id]
+	if !exists {
+		return nil, configs.ErrStreamNotFound
+	}
+
+	return stream, nil
+}
+
+// RemoveStream removes a stream from the manager
 func (sm *StreamManager) RemoveStream(id string) {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
+
+	// Close all client channels
+	if stream, exists := sm.Streams[id]; exists {
+		for _, viewer := range stream.Clients {
+			close(viewer.Channel)
+		}
+	}
+
 	delete(sm.Streams, id)
 }
 
-// RunIfNotRunning 필요시 스트림 시작
+// RunIfNotRunning starts a stream if it's not already running
 func (sm *StreamManager) RunIfNotRunning(id string) bool {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
@@ -93,14 +113,14 @@ func (sm *StreamManager) RunIfNotRunning(id string) bool {
 		return false
 	}
 
-	if stream.OnDemand && !stream.RunLock {
+	if !stream.RunLock {
 		stream.RunLock = true
 		return true
 	}
 	return false
 }
 
-// SetRunLock 스트림 잠금 상태 설정
+// SetRunLock sets the run lock state for a stream
 func (sm *StreamManager) SetRunLock(id string, lock bool) {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
@@ -110,7 +130,7 @@ func (sm *StreamManager) SetRunLock(id string, lock bool) {
 	}
 }
 
-// HasViewer 시청자 유무 확인
+// HasViewer checks if a stream has any viewers
 func (sm *StreamManager) HasViewer(id string) bool {
 	sm.mutex.RLock()
 	defer sm.mutex.RUnlock()
@@ -121,7 +141,7 @@ func (sm *StreamManager) HasViewer(id string) bool {
 	return false
 }
 
-// BroadcastPacket 모든 시청자에게 패킷 전송
+// BroadcastPacket sends a packet to all viewers of a stream
 func (sm *StreamManager) BroadcastPacket(id string, pkt av.Packet) {
 	sm.mutex.RLock()
 	defer sm.mutex.RUnlock()
@@ -133,12 +153,17 @@ func (sm *StreamManager) BroadcastPacket(id string, pkt av.Packet) {
 
 	for _, viewer := range stream.Clients {
 		if len(viewer.Channel) < cap(viewer.Channel) {
-			viewer.Channel <- pkt
+			select {
+			case viewer.Channel <- pkt:
+				// Packet sent successfully
+			default:
+				// Channel buffer full, skip this packet
+			}
 		}
 	}
 }
 
-// StreamExists 스트림 존재 확인
+// StreamExists checks if a stream exists
 func (sm *StreamManager) StreamExists(id string) bool {
 	sm.mutex.RLock()
 	defer sm.mutex.RUnlock()
@@ -146,7 +171,7 @@ func (sm *StreamManager) StreamExists(id string) bool {
 	return exists
 }
 
-// UpdateCodecs 코덱 정보 업데이트
+// UpdateCodecs updates codec information for a stream
 func (sm *StreamManager) UpdateCodecs(id string, codecs []av.CodecData) {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
@@ -156,27 +181,35 @@ func (sm *StreamManager) UpdateCodecs(id string, codecs []av.CodecData) {
 	}
 }
 
-// GetCodecs 코덱 정보 가져오기
+// GetCodecs retrieves codec information for a stream
 func (sm *StreamManager) GetCodecs(id string) ([]av.CodecData, error) {
-	for i := 0; i < 100; i++ {
+	// Try multiple times with short delay in case stream is initializing
+	const maxRetries = 100
+	const retryInterval = 50 * time.Millisecond
+
+	for i := 0; i < maxRetries; i++ {
 		sm.mutex.RLock()
 		stream, exists := sm.Streams[id]
-		sm.mutex.RUnlock()
 
 		if !exists {
+			sm.mutex.RUnlock()
 			return nil, configs.ErrStreamNotFound
 		}
 
 		if stream.Codecs != nil && len(stream.Codecs) > 0 {
-			return stream.Codecs, nil
+			codecs := stream.Codecs
+			sm.mutex.RUnlock()
+			return codecs, nil
 		}
 
-		time.Sleep(50 * time.Millisecond)
+		sm.mutex.RUnlock()
+		time.Sleep(retryInterval)
 	}
+
 	return nil, configs.ErrStreamChannelCodecNotFound
 }
 
-// AddClient 클라이언트 추가
+// AddClient adds a new client to a stream
 func (sm *StreamManager) AddClient(id string) (string, chan av.Packet, error) {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
@@ -193,17 +226,20 @@ func (sm *StreamManager) AddClient(id string) (string, chan av.Packet, error) {
 	return clientID, ch, nil
 }
 
-// RemoveClient 클라이언트 제거
+// RemoveClient removes a client from a stream
 func (sm *StreamManager) RemoveClient(streamID, clientID string) {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
 
 	if stream, exists := sm.Streams[streamID]; exists {
-		delete(stream.Clients, clientID)
+		if viewer, found := stream.Clients[clientID]; found {
+			close(viewer.Channel)
+			delete(stream.Clients, clientID)
+		}
 	}
 }
 
-// ListStreams 스트림 목록 조회
+// ListStreams returns a list of all stream IDs
 func (sm *StreamManager) ListStreams() []string {
 	sm.mutex.RLock()
 	defer sm.mutex.RUnlock()
@@ -213,10 +249,11 @@ func (sm *StreamManager) ListStreams() []string {
 		result = append(result, id)
 	}
 
+	sort.Strings(result)
 	return result
 }
 
-// AddHLSSegment HLS 세그먼트 추가
+// AddHLSSegment adds a new HLS segment to a stream
 func (sm *StreamManager) AddHLSSegment(id string, packets []*av.Packet, duration time.Duration) error {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
@@ -232,15 +269,26 @@ func (sm *StreamManager) AddHLSSegment(id string, packets []*av.Packet, duration
 		Data:     packets,
 	}
 
-	// 오래된 세그먼트 삭제
-	if len(stream.HLSSegmentBuffer) > 6 {
-		delete(stream.HLSSegmentBuffer, stream.HLSSegmentNumber-6)
+	// Cleanup old segments (keep last 6)
+	const maxSegments = 6
+	if len(stream.HLSSegmentBuffer) > maxSegments {
+		// Find oldest segment(s) to remove
+		var keys []int
+		for k := range stream.HLSSegmentBuffer {
+			keys = append(keys, k)
+		}
+		sort.Ints(keys)
+
+		// Remove all but the latest maxSegments
+		for i := 0; i < len(keys)-maxSegments; i++ {
+			delete(stream.HLSSegmentBuffer, keys[i])
+		}
 	}
 
 	return nil
 }
 
-// GetHLSM3U8 HLS M3U8 플레이리스트 가져오기
+// GetHLSM3U8 generates an M3U8 playlist for a stream
 func (sm *StreamManager) GetHLSM3U8(id string) (string, int, error) {
 	sm.mutex.RLock()
 	defer sm.mutex.RUnlock()
@@ -251,8 +299,10 @@ func (sm *StreamManager) GetHLSM3U8(id string) (string, int, error) {
 	}
 
 	var playlist string
-	playlist += "#EXTM3U\r\n#EXT-X-TARGETDURATION:4\r\n#EXT-X-VERSION:4\r\n"
-	playlist += "#EXT-X-MEDIA-SEQUENCE:" + strconv.Itoa(stream.HLSSegmentNumber) + "\r\n"
+	playlist += "#EXTM3U\r\n"
+	playlist += "#EXT-X-TARGETDURATION:4\r\n"
+	playlist += "#EXT-X-VERSION:4\r\n"
+	playlist += "#EXT-X-MEDIA-SEQUENCE:" + strconv.Itoa(stream.HLSSegmentNumber-len(stream.HLSSegmentBuffer)+1) + "\r\n"
 
 	var keys []int
 	for k := range stream.HLSSegmentBuffer {
@@ -271,7 +321,7 @@ func (sm *StreamManager) GetHLSM3U8(id string) (string, int, error) {
 	return playlist, segmentCount, nil
 }
 
-// GetHLSSegment HLS 세그먼트 가져오기
+// GetHLSSegment retrieves a specific HLS segment
 func (sm *StreamManager) GetHLSSegment(id string, seq int) ([]*av.Packet, error) {
 	sm.mutex.RLock()
 	defer sm.mutex.RUnlock()
@@ -289,7 +339,7 @@ func (sm *StreamManager) GetHLSSegment(id string, seq int) ([]*av.Packet, error)
 	return segment.Data, nil
 }
 
-// FlushHLSSegments HLS 세그먼트 초기화
+// FlushHLSSegments removes all HLS segments for a stream
 func (sm *StreamManager) FlushHLSSegments(id string) error {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
@@ -305,7 +355,9 @@ func (sm *StreamManager) FlushHLSSegments(id string) error {
 	return nil
 }
 
-// 유틸리티 함수
+// Utility functions
+
+// generateUUID generates a unique identifier
 func generateUUID() string {
 	b := make([]byte, 16)
 	_, err := rand.Read(b)
@@ -315,11 +367,10 @@ func generateUUID() string {
 	return fmt.Sprintf("%X-%X-%X-%X-%X", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
 }
 
-// StringToInt 문자열을 정수로 변환
-func StringToInt(val string) int {
-	i, err := strconv.Atoi(val)
-	if err != nil {
-		return 0
+// getEnvOrDefault gets an environment variable or returns the default
+func getEnvOrDefault(key, defaultValue string) string {
+	if value, exists := configs.GetEnv(key); exists && value != "" {
+		return value
 	}
-	return i
+	return defaultValue
 }
